@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#000000" />
+    <meta
+      name="description"
+      content="画笔传说 - 你画我猜在线游戏"
+    />
+    <link rel="apple-touch-icon" href="%PUBLIC_URL%/logo192.png" />
+    <!--
+      manifest.json 提供了 Web 应用的元数据。
+      当用户将 PWA 安装到其移动设备或桌面上时会使用它。
+      有关详细信息，请参阅 https://developers.google.com/web/fundamentals/web-app-manifest/
+    -->
+    <link rel="manifest" href="%PUBLIC_URL%/manifest.json" />
+    <!--
+        请注意上面标签中 %PUBLIC_URL% 的使用。
+        在构建过程中，它将被替换为 public 文件夹的 URL。
+        只有 public 文件夹中的文件可以从 HTML 中通过 %PUBLIC_URL% 引用。
+
+        与 /favicon.ico 或 favicon.ico 不同，%PUBLIC_URL%/favicon.ico 将
+        对于客户端路由和非根公共 URL 都能正常工作。
+        通过运行 `npm run build` 了解如何实现这一点。
+    -->
+    <title>画笔传说 - 你画我猜</title>
+    <!-- 
+      如果你选择通过 PostCSS 和构建流程集成 Tailwind CSS (推荐方式), 
+      则不需要下面这行 script 标签。
+      如果你希望通过 CDN 快速使用 Tailwind，则保留它。
+      在之前的 `package.json` 和 `postcss.config.js` 中，我们已经配置了通过构建流程集成 Tailwind。
+    -->
+    </head>
+  <body>
+    <noscript>你需要启用 JavaScript 来运行此应用。</noscript>
+    <div id="root"></div>
+    <!--
+      这个 HTML 文件是一个模板。
+      如果你直接在浏览器中打开它，你会看到一个空页面。
+
+      你可以将你的 webfonts、meta 标签或分析代码添加到这个文件中。
+      构建步骤会将构建好的 JavaScript 代码包放入 <body> 标签中。
+
+      要开始开发，请运行 `npm start` 或 `yarn start`。
+      要创建生产包，请使用 `npm run build` 或 `yarn build`。
+    -->
+  </body>
+</html>

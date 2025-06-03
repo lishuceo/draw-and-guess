@@ -1,0 +1,227 @@
+/* Tailwind CSS 指令 */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 你可以在这里添加其他全局样式 */
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: #F3F4F6; /* 对应设计文档的背景浅灰色 */
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+/* 为键盘元素添加一些基本样式 */
+kbd {
+  background-color: #eee;
+  border-radius: 3px;
+  border: 1px solid #b4b4b4;
+  box-shadow: 0 1px 1px rgba(0, 0, 0, .2), 0 2px 0 0 rgba(255, 255, 255, .7) inset;
+  color: #333;
+  display: inline-block;
+  font-size: .85em;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+
+/* 添加自定义动画 */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-20px);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+@keyframes pulse-fast {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes bounce-once {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  25% {
+    transform: translateY(-10px);
+  }
+  50% {
+    transform: translateY(0);
+  }
+  75% {
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes confetti {
+  0% {
+    transform: translateY(0) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-120vh) rotate(720deg);
+    opacity: 0;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out;
+}
+
+.animate-bounce {
+  animation: bounce 0.5s ease-in-out infinite;
+}
+
+.animate-bounce-once {
+  animation: bounce-once 0.6s ease-out;
+}
+
+.animate-pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.animate-pulse-fast {
+  animation: pulse-fast 0.8s ease-in-out infinite;
+}
+
+.animate-confetti {
+  animation: confetti 3s ease-out forwards;
+}
+
+/* 移动端视口优化 */
+@media (max-width: 1024px) {
+  /* 确保画布容器使用可用空间 */
+  .drawing-board-container {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+  
+  /* 防止iOS Safari的弹性滚动影响画布 */
+  body {
+    position: fixed;
+    width: 100%;
+    height: 100vh;
+    height: 100dvh; /* 使用动态视口高度 */
+    overflow: hidden;
+  }
+  
+  /* 主应用容器 */
+  #root {
+    height: 100vh;
+    height: 100dvh; /* 使用动态视口高度 */
+    overflow: hidden;
+  }
+  
+  /* 确保主容器正确填充 */
+  #root > div {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+  
+  /* 游戏房间容器优化 */
+  .h-screen {
+    height: 100vh;
+    height: 100dvh;
+  }
+  
+  /* 优化flex-grow元素 */
+  .flex-grow {
+    flex: 1 1 0%;
+    min-height: 0;
+    overflow: hidden;
+  }
+}
+
+/* 画布响应式优化 */
+canvas {
+  touch-action: none; /* 禁用触摸手势，防止页面滚动 */
+  user-select: none; /* 禁用文本选择 */
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  display: block;
+}
+
+/* 画布容器优化 */
+.bg-gray-100.rounded-lg {
+  position: relative;
+}
+
+/* 防止移动端双击缩放 */
+@media (max-width: 640px) {
+  * {
+    touch-action: manipulation;
+  }
+  
+  /* 优化手机端的固定高度元素 */
+  .h-\[140px\] {
+    height: min(140px, 20vh);
+  }
+  
+  .h-\[60px\] {
+    height: min(60px, 10vh);
+  }
+  
+  /* 确保画布容器在手机端正确显示 */
+  main.flex-grow > div:first-child {
+    flex: 1 1 0%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+}
+
+/* 确保flexbox布局在Safari中正常工作 */
+.flex-grow {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+.flex-1 {
+  flex: 1 1 0%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.min-h-0 {
+  min-height: 0;
+}

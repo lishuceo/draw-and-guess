@@ -1,0 +1,26 @@
+{
+  "short_name": "画笔传说",
+  "name": "画笔传说 - 你画我猜游戏",
+  "icons": [
+    {
+      "src": "favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    },
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "logo512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#000000",
+  "background_color": "#ffffff",
+  "description": "一个有趣的在线多人画画猜词游戏，考验你的绘画技巧和想象力！"
+} 
