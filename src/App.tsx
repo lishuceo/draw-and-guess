@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged, User, signInWithCustomToken } from 'firebase/auth'; // Added signInWithCustomToken
-import { getFirestore, doc, setDoc, onSnapshot, updateDoc, arrayUnion, collection, addDoc, serverTimestamp, DocumentData, Unsubscribe, query, where, getDocs, deleteDoc, writeBatch, setLogLevel, getDoc } from 'firebase/firestore'; // Added getDoc and setLogLevel
+import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, addDoc, serverTimestamp, DocumentData, Unsubscribe, query, where, getDocs, deleteDoc, writeBatch, setLogLevel, getDoc } from 'firebase/firestore'; // Added getDoc and setLogLevel
 import { SketchPicker, ColorResult } from 'react-color';
 import { Pen as LucidePen, Eraser as LucideEraser, Trash2 as LucideTrash2, Palette as LucidePalette, Play as LucidePlay, Users as LucideUsers, Plus as LucidePlus, LogIn as LucideLogIn, Eye as LucideEye, MessageSquare as LucideMessageSquare, Send as LucideSend, Crown as LucideCrown, Clock as LucideClock, Paintbrush as LucidePaintbrush, HelpCircle as LucideHelpCircle, Settings as LucideSettings, BarChart as LucideBarChart, UserCircle as LucideUserCircle, Copy as LucideCopy } from 'lucide-react';
 
@@ -28,6 +28,9 @@ const auth = getAuth(app);
 const getRoomsCollectionPath = () => `artifacts/${appId}/public/data/draw_guess_rooms`;
 const getRoomDocPath = (roomId: string) => `artifacts/${appId}/public/data/draw_guess_rooms/${roomId}`;
 
+// --- 性能优化常量 ---
+const MAX_CHAT_MESSAGES = 50; // 限制聊天消息数量，防止文档过大
+const MAX_USED_WORDS = 100; // 限制已用词汇数量
 
 // --- 类型定义 ---
 interface Point {
@@ -72,7 +75,7 @@ interface GameRoom {
   timeLeft: number;
   currentRound: number;
   maxRounds: number;
-  drawingPaths: Path[];
+  drawingPaths: Path[];  // 保留以兼容，但将逐步废弃
   chatMessages: ChatMessage[];
   status: 'waiting' | 'playing' | 'round_end' | 'game_end';
   difficulty: 'easy' | 'medium' | 'hard';
@@ -81,6 +84,93 @@ interface GameRoom {
   guessedPlayerIds: string[];
   usedWords: string[];
   wordLength: number;
+  // 新增：循环缓冲区方式存储最近笔画
+  recentStrokes?: {
+    strokes: Path[];      // 最近的N笔画（如100笔）
+    startSequence: number; // 缓冲区中第一笔的序号
+    totalSequence: number; // 总序号计数器
+  };
+}
+
+// --- 客户端笔画管理类 ---
+class DrawingHistoryManager {
+  private allStrokes: Path[] = [];
+  private lastSyncedSequence: number = -1;
+  private maxRecentStrokes: number = 1; // Firebase 中保存的最大笔画数
+
+  // 从 recentStrokes 提取新笔画
+  extractNewStrokes(recentStrokes: { strokes: Path[]; startSequence: number; totalSequence: number } | undefined): Path[] {
+    if (!recentStrokes) return [];
+    
+    const { strokes, startSequence, totalSequence } = recentStrokes;
+    
+    // 如果是第一次同步或者序号差距过大，使用所有可用的笔画
+    if (this.lastSyncedSequence === -1 || this.lastSyncedSequence < startSequence - 1) {
+      this.allStrokes = [...strokes];
+      this.lastSyncedSequence = totalSequence - 1;
+      return strokes;
+    }
+    
+    // 计算需要的新笔画
+    const newStrokesCount = totalSequence - this.lastSyncedSequence - 1;
+    if (newStrokesCount <= 0) return [];
+    
+    // 从缓冲区提取新笔画
+    const bufferStartIndex = Math.max(0, strokes.length - (totalSequence - startSequence));
+    const newStartIndex = Math.max(0, bufferStartIndex + (this.lastSyncedSequence - startSequence + 1));
+    const newStrokes = strokes.slice(newStartIndex);
+    
+    this.lastSyncedSequence = totalSequence - 1;
+    return newStrokes;
+  }
+
+  // 添加新笔画到本地历史
+  addNewStrokes(newStrokes: Path[]) {
+    this.allStrokes.push(...newStrokes);
+  }
+
+  // 获取所有笔画
+  getAllStrokes(): Path[] {
+    return this.allStrokes;
+  }
+
+  // 清空历史（新回合开始时）
+  clear() {
+    this.allStrokes = [];
+    this.lastSyncedSequence = -1;
+  }
+
+  // 创建循环缓冲区更新
+  static createRecentStrokesUpdate(
+    currentRecentStrokes: { strokes: Path[]; startSequence: number; totalSequence: number } | undefined,
+    newPath: Path,
+    maxSize: number = 1
+  ): { strokes: Path[]; startSequence: number; totalSequence: number } {
+    if (!currentRecentStrokes) {
+      return {
+        strokes: [newPath],
+        startSequence: 0,
+        totalSequence: 1
+      };
+    }
+
+    const { strokes, startSequence, totalSequence } = currentRecentStrokes;
+    let newStrokes = [...strokes, newPath];
+    let newStartSequence = startSequence;
+
+    // 如果超过最大大小，移除最旧的笔画
+    if (newStrokes.length > maxSize) {
+      const removeCount = newStrokes.length - maxSize;
+      newStrokes = newStrokes.slice(removeCount);
+      newStartSequence = startSequence + removeCount;
+    }
+
+    return {
+      strokes: newStrokes,
+      startSequence: newStartSequence,
+      totalSequence: totalSequence + 1
+    };
+  }
 }
 
 // --- 颜色常量 (根据设计文档) ---
@@ -159,6 +249,75 @@ const getRandomInt = (max: number): number => {
   return Math.floor((randomValue / 233280) * max);
 };
 
+// Douglas-Peucker 路径简化算法
+const simplifyPath = (points: Point[], tolerance: number = 2): Point[] => {
+  if (points.length <= 2) return points;
+  
+  // 计算点到线段的垂直距离
+  const perpendicularDistance = (point: Point, lineStart: Point, lineEnd: Point): number => {
+    const dx = lineEnd.x - lineStart.x;
+    const dy = lineEnd.y - lineStart.y;
+    
+    if (dx === 0 && dy === 0) {
+      // 线段起点和终点相同
+      const px = point.x - lineStart.x;
+      const py = point.y - lineStart.y;
+      return Math.sqrt(px * px + py * py);
+    }
+    
+    const t = ((point.x - lineStart.x) * dx + (point.y - lineStart.y) * dy) / (dx * dx + dy * dy);
+    const clamped = Math.max(0, Math.min(1, t));
+    
+    const nearestX = lineStart.x + clamped * dx;
+    const nearestY = lineStart.y + clamped * dy;
+    
+    const distX = point.x - nearestX;
+    const distY = point.y - nearestY;
+    
+    return Math.sqrt(distX * distX + distY * distY);
+  };
+  
+  // 递归简化
+  const simplifyRecursive = (start: number, end: number): number[] => {
+    let maxDistance = 0;
+    let maxIndex = 0;
+    
+    // 找到距离最远的点
+    for (let i = start + 1; i < end; i++) {
+      const distance = perpendicularDistance(points[i], points[start], points[end]);
+      if (distance > maxDistance) {
+        maxDistance = distance;
+        maxIndex = i;
+      }
+    }
+    
+    // 如果最大距离大于容差，递归处理两边
+    if (maxDistance > tolerance) {
+      const left = simplifyRecursive(start, maxIndex);
+      const right = simplifyRecursive(maxIndex, end);
+      
+      // 合并结果，去除重复的中间点
+      return [...left.slice(0, -1), ...right];
+    } else {
+      // 只保留起点和终点
+      return [start, end];
+    }
+  };
+  
+  const indices = simplifyRecursive(0, points.length - 1);
+  return indices.map(i => points[i]);
+};
+
+// 限制聊天消息数量的辅助函数
+const addChatMessage = (currentMessages: ChatMessage[], newMessage: ChatMessage): ChatMessage[] => {
+  const allMessages = [...currentMessages, newMessage];
+  // 如果超过最大数量，只保留最新的消息
+  if (allMessages.length > MAX_CHAT_MESSAGES) {
+    return allMessages.slice(-MAX_CHAT_MESSAGES);
+  }
+  return allMessages;
+};
+
 // 改进的洗牌算法 (Fisher-Yates)
 function shuffleArray<T>(array: T[]): T[] {
   const shuffled = [...array];
@@ -224,8 +383,27 @@ const DrawingBoard: React.FC<{
   currentTool: 'pen' | 'eraser';
 }> = ({ paths, onDraw, currentColor, currentWidth, isDrawingDisabled, onClear, currentTool }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null); // 离屏canvas用于持久化
   const [isPainting, setIsPainting] = useState(false);
   const [currentPathPoints, setCurrentPathPoints] = useState<Point[]>([]); // Renamed to avoid conflict
+  const lastPathsLengthRef = useRef(0); // 记录上次绘制的路径数量
+  const lastPointTimeRef = useRef(0); // 用于节流
+  const MIN_POINT_DISTANCE = 3; // 最小点距离（像素）
+
+  // 绘制单条路径的通用函数
+  const drawSinglePath = (ctx: CanvasRenderingContext2D, path: Path) => {
+      if (path.points.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(path.points[0].x, path.points[0].y);
+      for (let i = 1; i < path.points.length; i++) {
+        ctx.lineTo(path.points[i].x, path.points[i].y);
+      }
+      ctx.strokeStyle = path.color;
+      ctx.lineWidth = path.width;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+  };
 
   const getCoordinates = (event: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>): Point | null => {
     if (!canvasRef.current) return null;
@@ -257,7 +435,21 @@ const DrawingBoard: React.FC<{
     if (!isPainting || isDrawingDisabled) return;
     const coords = getCoordinates(event);
     if (coords) {
-      setCurrentPathPoints(prev => [...prev, { ...coords }]);
+      setCurrentPathPoints(prev => {
+        if (prev.length === 0) return [coords];
+        
+        // 计算与上一个点的距离
+        const lastPoint = prev[prev.length - 1];
+        const dx = coords.x - lastPoint.x;
+        const dy = coords.y - lastPoint.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        
+        // 只有当距离大于最小距离时才添加点
+        if (distance >= 3) { // 使用硬编码的3像素最小距离
+          return [...prev, { ...coords }];
+        }
+        return prev;
+      });
     }
     event.preventDefault(); // Prevent scrolling on touch devices
   }, [isPainting, isDrawingDisabled]);
@@ -266,9 +458,19 @@ const DrawingBoard: React.FC<{
     if (!isPainting || isDrawingDisabled) return;
     setIsPainting(false);
     if (currentPathPoints.length > 1) {
+      // 简化路径，减少点的数量
+      const simplifiedPoints = simplifyPath(currentPathPoints, 2); // 容差值2像素
+      
+      // 计算简化前后的数据大小
+      const originalSize = JSON.stringify({ points: currentPathPoints }).length;
+      const simplifiedSize = JSON.stringify({ points: simplifiedPoints }).length;
+      
+      console.log(`路径简化: ${currentPathPoints.length} 点 -> ${simplifiedPoints.length} 点 (减少 ${Math.round((1 - simplifiedPoints.length / currentPathPoints.length) * 100)}%)`);
+      console.log(`数据大小: ${originalSize} 字节 -> ${simplifiedSize} 字节 (减少 ${Math.round((1 - simplifiedSize / originalSize) * 100)}%)`);
+      
       onDraw({
         id: crypto.randomUUID(),
-        points: currentPathPoints,
+        points: simplifiedPoints,
         color: currentTool === 'eraser' ? COLORS.backgroundWhite : currentColor,
         width: currentTool === 'eraser' ? 20 : currentWidth,
       });
@@ -279,44 +481,73 @@ const DrawingBoard: React.FC<{
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    
+    const MIN_POINT_DISTANCE = 3; // 最小点距离（像素）
 
-    // Native event handlers for addEventListener
-    const handleNativeMouseDown = (event: MouseEvent) => {
-      if (isDrawingDisabled) return;
+    // 初始化离屏canvas
+    if (!offscreenCanvasRef.current) {
+      offscreenCanvasRef.current = document.createElement('canvas');
+      // 设置初始尺寸，避免0尺寸问题
       const rect = canvas.getBoundingClientRect();
-      const coords = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-      setIsPainting(true);
-      setCurrentPathPoints([{ ...coords }]);
+      const dpr = window.devicePixelRatio || 1;
+      offscreenCanvasRef.current.width = rect.width * dpr;
+      offscreenCanvasRef.current.height = rect.height * dpr;
+      const offscreenCtx = offscreenCanvasRef.current.getContext('2d');
+      if (offscreenCtx) {
+        offscreenCtx.scale(dpr, dpr);
+        offscreenCtx.fillStyle = COLORS.backgroundWhite;
+        offscreenCtx.fillRect(0, 0, rect.width, rect.height);
+      }
+    }
+
+    // 增量绘制新路径到离屏canvas
+    const drawIncrementalPaths = () => {
+        const offscreenCtx = offscreenCanvasRef.current!.getContext('2d');
+        if (!offscreenCtx) return;
+        
+        // 如果路径数量减少（清空操作），需要清空离屏canvas并重绘
+        if (paths.length < lastPathsLengthRef.current) {
+          const dpr = window.devicePixelRatio || 1;
+          offscreenCtx.clearRect(0, 0, offscreenCanvasRef.current!.width / dpr, offscreenCanvasRef.current!.height / dpr);
+          offscreenCtx.fillStyle = COLORS.backgroundWhite;
+          offscreenCtx.fillRect(0, 0, offscreenCanvasRef.current!.width / dpr, offscreenCanvasRef.current!.height / dpr);
+          lastPathsLengthRef.current = 0;
+        }
+        
+        // 只绘制新增的路径
+        for (let i = lastPathsLengthRef.current; i < paths.length; i++) {
+            drawSinglePath(offscreenCtx, paths[i]);
+        }
+        lastPathsLengthRef.current = paths.length;
     };
 
-    const handleNativeMouseMove = (event: MouseEvent) => {
-      if (!isPainting || isDrawingDisabled) return;
-      const rect = canvas.getBoundingClientRect();
-      const coords = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-      setCurrentPathPoints(prev => [...prev, { ...coords }]);
-    };
-
-    const handleNativeTouchStart = (event: TouchEvent) => {
-      if (isDrawingDisabled || !event.touches.length) return;
-      event.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      const coords = { 
-        x: event.touches[0].clientX - rect.left, 
-        y: event.touches[0].clientY - rect.top 
-      };
-      setIsPainting(true);
-      setCurrentPathPoints([{ ...coords }]);
-    };
-
-    const handleNativeTouchMove = (event: TouchEvent) => {
-      if (!isPainting || isDrawingDisabled || !event.touches.length) return;
-      event.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      const coords = { 
-        x: event.touches[0].clientX - rect.left, 
-        y: event.touches[0].clientY - rect.top 
-      };
-      setCurrentPathPoints(prev => [...prev, { ...coords }]);
+    // 渲染函数：复制离屏canvas内容并绘制当前路径
+    const renderCanvas = () => {
+        const ctx = canvas.getContext('2d');
+        if (!ctx || !offscreenCanvasRef.current) return;
+        
+        // 检查离屏canvas是否有有效尺寸
+        if (offscreenCanvasRef.current.width === 0 || offscreenCanvasRef.current.height === 0) {
+            return;
+        }
+        
+        const dpr = window.devicePixelRatio || 1;
+        
+        // 清空主canvas
+        ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+        
+        // 复制离屏canvas的内容
+        ctx.drawImage(offscreenCanvasRef.current, 0, 0, canvas.width / dpr, canvas.height / dpr);
+        
+        // 只绘制当前正在绘制的路径
+        if (isPainting && currentPathPoints.length > 0) {
+            drawSinglePath(ctx, {
+                id: 'current',
+                points: currentPathPoints,
+                color: currentTool === 'eraser' ? COLORS.backgroundWhite : currentColor,
+                width: currentTool === 'eraser' ? 20 : currentWidth,
+            });
+        }
     };
 
     const resizeCanvas = () => {
@@ -339,46 +570,97 @@ const DrawingBoard: React.FC<{
                 ctx.scale(dpr, dpr);
             }
             
-            drawAllPathsOnCanvas(); 
+            // 调整离屏canvas大小
+            if (offscreenCanvasRef.current) {
+                offscreenCanvasRef.current.width = canvas.width;
+                offscreenCanvasRef.current.height = canvas.height;
+                const offscreenCtx = offscreenCanvasRef.current.getContext('2d');
+                if (offscreenCtx) {
+                    offscreenCtx.scale(dpr, dpr);
+                    // 填充白色背景
+                    offscreenCtx.fillStyle = COLORS.backgroundWhite;
+                    offscreenCtx.fillRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+                }
+            }
+            
+            // 重新绘制所有路径到离屏canvas
+            lastPathsLengthRef.current = 0;
+            drawIncrementalPaths();
+            renderCanvas();
         }
     };
 
-    const drawAllPathsOnCanvas = () => { // Renamed to avoid conflict
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+    // Native event handlers for addEventListener
+    const handleNativeMouseDown = (event: MouseEvent) => {
+      if (isDrawingDisabled) return;
+      const rect = canvas.getBoundingClientRect();
+      const coords = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      setIsPainting(true);
+      setCurrentPathPoints([{ ...coords }]);
+    };
+
+    const handleNativeMouseMove = (event: MouseEvent) => {
+      if (!isPainting || isDrawingDisabled) return;
+      const rect = canvas.getBoundingClientRect();
+      const coords = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      
+      setCurrentPathPoints(prev => {
+        if (prev.length === 0) return [coords];
         
-        const dpr = window.devicePixelRatio || 1;
-        ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr); 
-        ctx.fillStyle = COLORS.backgroundWhite;
-        ctx.fillRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+        // 计算与上一个点的距离
+        const lastPoint = prev[prev.length - 1];
+        const dx = coords.x - lastPoint.x;
+        const dy = coords.y - lastPoint.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        
+        // 只有当距离大于最小距离时才添加点
+        if (distance >= MIN_POINT_DISTANCE) {
+          return [...prev, coords];
+        }
+        return prev;
+      });
+    };
 
-        paths.forEach(path => drawSinglePath(ctx, path)); // Renamed to avoid conflict
-        if (isPainting && currentPathPoints.length > 0) {
-            drawSinglePath(ctx, { // Renamed to avoid conflict
-                id: 'current',
-                points: currentPathPoints,
-                color: currentTool === 'eraser' ? COLORS.backgroundWhite : currentColor,
-                width: currentTool === 'eraser' ? 20 : currentWidth,
-            });
-        }
+    const handleNativeTouchStart = (event: TouchEvent) => {
+      if (isDrawingDisabled || !event.touches.length) return;
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const coords = { 
+        x: event.touches[0].clientX - rect.left, 
+        y: event.touches[0].clientY - rect.top 
+      };
+      setIsPainting(true);
+      setCurrentPathPoints([{ ...coords }]);
     };
-    
-    const drawSinglePath = (ctx: CanvasRenderingContext2D, path: Path) => { // Renamed to avoid conflict
-        if (path.points.length < 2) return;
-        ctx.beginPath();
-        ctx.moveTo(path.points[0].x, path.points[0].y);
-        for (let i = 1; i < path.points.length; i++) {
-          ctx.lineTo(path.points[i].x, path.points[i].y);
+
+    const handleNativeTouchMove = (event: TouchEvent) => {
+      if (!isPainting || isDrawingDisabled || !event.touches.length) return;
+      event.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const coords = { 
+        x: event.touches[0].clientX - rect.left, 
+        y: event.touches[0].clientY - rect.top 
+      };
+      
+      setCurrentPathPoints(prev => {
+        if (prev.length === 0) return [coords];
+        
+        // 计算与上一个点的距离
+        const lastPoint = prev[prev.length - 1];
+        const dx = coords.x - lastPoint.x;
+        const dy = coords.y - lastPoint.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        
+        // 只有当距离大于最小距离时才添加点
+        if (distance >= MIN_POINT_DISTANCE) {
+          return [...prev, coords];
         }
-        ctx.strokeStyle = path.color;
-        ctx.lineWidth = path.width;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        ctx.stroke();
+        return prev;
+      });
     };
-    
+
     resizeCanvas();
-    drawAllPathsOnCanvas();
+    renderCanvas();
 
     window.addEventListener('resize', resizeCanvas);
     canvas.addEventListener('mousedown', handleNativeMouseDown);
@@ -402,11 +684,76 @@ const DrawingBoard: React.FC<{
       canvas.removeEventListener('touchend', endPaint);
       canvas.removeEventListener('touchcancel', endPaint);
     };
-  }, [paths, currentColor, currentWidth, currentTool, isPainting, currentPathPoints, isDrawingDisabled, endPaint]);
+  }, [isDrawingDisabled, endPaint]); // 只依赖必要的值
+
+  // 处理路径变化时的增量绘制
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !offscreenCanvasRef.current) return;
+
+    // 增量绘制新路径到离屏canvas
+    const drawIncrementalPaths = () => {
+        const offscreenCtx = offscreenCanvasRef.current!.getContext('2d');
+        if (!offscreenCtx) return;
+        
+        // 如果路径数量减少（清空操作），需要清空离屏canvas并重绘
+        if (paths.length < lastPathsLengthRef.current) {
+          const dpr = window.devicePixelRatio || 1;
+          offscreenCtx.clearRect(0, 0, offscreenCanvasRef.current!.width / dpr, offscreenCanvasRef.current!.height / dpr);
+          offscreenCtx.fillStyle = COLORS.backgroundWhite;
+          offscreenCtx.fillRect(0, 0, offscreenCanvasRef.current!.width / dpr, offscreenCanvasRef.current!.height / dpr);
+          lastPathsLengthRef.current = 0;
+        }
+        
+        // 只绘制新增的路径
+        for (let i = lastPathsLengthRef.current; i < paths.length; i++) {
+            drawSinglePath(offscreenCtx, paths[i]);
+        }
+        lastPathsLengthRef.current = paths.length;
+    };
+
+    drawIncrementalPaths();
+  }, [paths]);
+
+  // 处理绘制过程中的实时渲染
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !offscreenCanvasRef.current) return;
+
+    const renderCanvas = () => {
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        
+        // 检查离屏canvas是否有有效尺寸
+        if (!offscreenCanvasRef.current || offscreenCanvasRef.current.width === 0 || offscreenCanvasRef.current.height === 0) {
+            return;
+        }
+        
+        const dpr = window.devicePixelRatio || 1;
+        
+        // 清空主canvas
+        ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+        
+        // 复制离屏canvas的内容
+        ctx.drawImage(offscreenCanvasRef.current!, 0, 0, canvas.width / dpr, canvas.height / dpr);
+        
+        // 只绘制当前正在绘制的路径
+        if (isPainting && currentPathPoints.length > 0) {
+            drawSinglePath(ctx, {
+                id: 'current',
+                points: currentPathPoints,
+                color: currentTool === 'eraser' ? COLORS.backgroundWhite : currentColor,
+                width: currentTool === 'eraser' ? 20 : currentWidth,
+            });
+        }
+    };
+
+    renderCanvas();
+  }, [isPainting, currentPathPoints, currentColor, currentWidth, currentTool, paths]); // 添加 paths 依赖以在路径更新后也重新渲染
 
 
   return (
-    <div className="w-full h-full bg-white rounded-lg shadow-md relative overflow-hidden">
+    <div className="w-full h-full bg-white rounded-none lg:rounded-lg shadow-none lg:shadow-md relative overflow-hidden">
       <canvas
         ref={canvasRef}
         onMouseDown={startPaint}
@@ -603,48 +950,48 @@ const GameInfoBar: React.FC<{
   wordLength: number;
 }> = ({ currentWord, wordHint, timeLeft, currentRound, maxRounds, isDrawer, wordCategory, wordLength }) => {
   return (
-    <div className="bg-white p-3 rounded-lg shadow-md flex flex-col sm:flex-row justify-between items-center gap-2 text-textDark">
-      <div className="text-center sm:text-left">
+    <div className="bg-white p-1 sm:p-3 rounded-lg shadow-md flex justify-between items-center gap-2 text-textDark mx-0.5 lg:mx-0">
+      <div className="text-left">
         {isDrawer ? (
-          <>
-            <p className="text-sm text-gray-500">词汇 ({wordCategory})</p>
-            <p className="text-xl font-bold">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-gray-500">{wordCategory}</span>
+            <p className="text-sm sm:text-xl font-bold">
               {currentWord}
             </p>
-          </>
+          </div>
         ) : (
           wordLength > 0 && (
-            <p className="text-lg text-gray-700">
+            <p className="text-sm sm:text-lg text-gray-700">
               {wordLength} 个字
             </p>
           )
         )}
       </div>
-      <div className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all duration-300 ${
+      <div className={`flex items-center gap-1 px-1 py-0.5 sm:px-2 sm:py-1 rounded-lg transition-all duration-300 ${
         timeLeft <= 10 
           ? 'bg-red-100 border-2 border-red-500 shadow-lg animate-pulse-fast' 
           : timeLeft <= 30 
             ? 'bg-yellow-50 border border-yellow-400' 
             : ''
       }`}>
-        <LucideClock size={timeLeft <= 10 ? 24 : 20} className={`${
+        <LucideClock size={timeLeft <= 10 ? 16 : 14} className={`${
           timeLeft <= 10 ? 'text-red-600' : timeLeft <= 30 ? 'text-yellow-600' : 'text-primary'
         }`} />
         <span className={`font-bold transition-all ${
           timeLeft <= 5 
-            ? 'text-3xl text-red-600 animate-bounce' 
+            ? 'text-lg sm:text-2xl text-red-600 animate-bounce' 
             : timeLeft <= 10 
-              ? 'text-2xl text-red-600' 
+              ? 'text-base sm:text-xl text-red-600' 
               : timeLeft <= 30 
-                ? 'text-xl text-yellow-600' 
-                : 'text-lg text-gray-700'
+                ? 'text-sm sm:text-lg text-yellow-600' 
+                : 'text-sm sm:text-base text-gray-700'
         }`}>
           {timeLeft}
-          <span className="text-sm ml-1">秒</span>
+          <span className="text-xs ml-0.5">秒</span>
         </span>
       </div>
-      <div className="text-sm text-gray-500">
-        回合: <span className="font-semibold">{currentRound}/{maxRounds}</span>
+      <div className="text-xs sm:text-sm text-gray-500">
+        <span className="font-semibold">{currentRound}/{maxRounds}</span>
       </div>
     </div>
   );
@@ -904,6 +1251,13 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
   const [showSummaryModal, setShowSummaryModal] = useState(false);
   const [pendingSummary, setPendingSummary] = useState(false);
 
+  // 新增：笔画历史管理器
+  const drawingHistoryRef = useRef(new DrawingHistoryManager());
+  const [localDrawingPaths, setLocalDrawingPaths] = useState<Path[]>([]);
+  
+  // 临时调试功能：显示更新日志
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+
   const gameTimerRef = useRef<NodeJS.Timeout | null>(null);
   const heartbeatTimerRef = useRef<NodeJS.Timeout | null>(null); // 新增：心跳定时器
 
@@ -912,38 +1266,51 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
 
   // 新增：心跳更新函数
   const updateHeartbeat = useCallback(async () => {
-    if (!gameRoom || !userId) return;
+    if (!userId || !roomId) return;
     
     const roomDocPath = getRoomDocPath(roomId);
     const roomDocRef = doc(db, roomDocPath);
     
     try {
-      const updatedPlayers = gameRoom.players.map(p => 
+      // 先获取最新的房间数据
+      const roomSnapshot = await getDoc(roomDocRef);
+      if (!roomSnapshot.exists()) return;
+      
+      const currentRoomData = roomSnapshot.data() as GameRoom;
+      const updatedPlayers = currentRoomData.players.map(p => 
         p.id === userId 
           ? { ...p, lastHeartbeat: Date.now() }
           : p
       );
       
       await updateDoc(roomDocRef, { players: updatedPlayers });
+      console.log(`[心跳] 更新成功，时间: ${new Date().toLocaleTimeString()}`);
     } catch (err) {
       console.error("Error updating heartbeat:", err);
     }
-  }, [gameRoom, userId, roomId]);
+  }, [userId, roomId]); // 不再依赖 gameRoom
 
   // 新增：心跳定时器effect
   useEffect(() => {
     // 每30秒更新一次心跳
-    if (gameRoom && userId) {
+    if (userId && roomId) {
+      console.log(`[心跳] 启动心跳定时器，间隔: 30秒`); // 添加日志
       updateHeartbeat(); // 立即更新一次
-      heartbeatTimerRef.current = setInterval(updateHeartbeat, 30000);
+      const intervalId = setInterval(() => {
+        console.log(`[心跳] 执行心跳更新`); // 添加日志
+        updateHeartbeat();
+      }, 30000);
+      heartbeatTimerRef.current = intervalId;
+      
+      return () => {
+        console.log(`[心跳] 清理心跳定时器`); // 添加日志
+        if (heartbeatTimerRef.current) {
+          clearInterval(heartbeatTimerRef.current);
+          heartbeatTimerRef.current = null;
+        }
+      };
     }
-    
-    return () => {
-      if (heartbeatTimerRef.current) {
-        clearInterval(heartbeatTimerRef.current);
-      }
-    };
-  }, [updateHeartbeat, gameRoom, userId]);
+  }, [userId, roomId, updateHeartbeat]); // 添加 updateHeartbeat 依赖
 
   // Firestore listener for game room updates
   useEffect(() => {
@@ -953,7 +1320,26 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
       if (docSnap.exists()) {
         const roomData = docSnap.data() as GameRoom;
         const prevStatus = gameRoom?.status;
+        
         setGameRoom(roomData);
+        
+        // 处理增量笔画更新
+        if (roomData.recentStrokes) {
+          const newStrokes = drawingHistoryRef.current.extractNewStrokes(roomData.recentStrokes);
+          if (newStrokes.length > 0) {
+            drawingHistoryRef.current.addNewStrokes(newStrokes);
+            setLocalDrawingPaths([...drawingHistoryRef.current.getAllStrokes()]);
+          }
+        } else if (roomData.drawingPaths && roomData.drawingPaths.length > 0) {
+          // 兼容旧数据：如果还在使用 drawingPaths
+          setLocalDrawingPaths(roomData.drawingPaths);
+        }
+        
+        // 新回合开始时清空笔画历史
+        if (prevStatus && prevStatus !== 'playing' && roomData.status === 'playing') {
+          drawingHistoryRef.current.clear();
+          setLocalDrawingPaths([]);
+        }
         
         if (roomData.currentDrawerId === userId && !roomData.currentWord && roomData.status === 'playing') {
           setShowWordChoice(true);
@@ -1009,7 +1395,7 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
       };
       try {
         await updateDoc(roomDocRef, {
-          players: arrayUnion(newPlayer)
+          players: [...gameRoom.players, newPlayer]
         });
       } catch (err) {
         console.error("Error joining room:", err);
@@ -1068,17 +1454,61 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
 
   const handleDraw = useCallback(async (path: Path) => {
     if (!gameRoom || !isDrawer) return;
+    const startTime = performance.now(); // 记录开始时间
     const roomDocPath = getRoomDocPath(roomId);
     const roomDocRef = doc(db, roomDocPath);
     try {
+      // 使用新的循环缓冲区方式
+      const newRecentStrokes = DrawingHistoryManager.createRecentStrokesUpdate(
+        gameRoom.recentStrokes,
+        path,
+        1 // 最多保存1笔
+      );
+      
       await updateDoc(roomDocRef, {
-        drawingPaths: arrayUnion(path)
+        recentStrokes: newRecentStrokes
+        // 移除 drawingPaths 的更新，避免数据量翻倍
       });
+      
+      const endTime = performance.now(); // 记录结束时间
+      const elapsedTime = endTime - startTime; // 计算耗时
+      
+      // 计算数据大小（粗略估算）
+      const dataSize = JSON.stringify(path).length;
+      
+      // 临时调试功能：打印更新成功日志
+      const timestamp = new Date().toLocaleTimeString('zh-CN', { 
+        hour12: false, 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit', 
+        fractionalSecondDigits: 3 
+      });
+      const logMessage = `[${timestamp}] 笔画更新成功！耗时: ${elapsedTime.toFixed(2)}ms, 点数: ${path.points.length}, 数据大小: ${dataSize}字节, 序号: ${newRecentStrokes.totalSequence}`;
+      console.log(logMessage, {
+        笔画ID: path.id,
+        点数: path.points.length,
+        颜色: path.color,
+        粗细: path.width,
+        总序号: newRecentStrokes.totalSequence,
+        缓冲区大小: newRecentStrokes.strokes.length,
+        耗时毫秒: elapsedTime,
+        数据字节数: dataSize
+      });
+      
+      // 更新调试日志显示（最多显示最近5条）
+      setDebugLogs(prev => [logMessage, ...prev.slice(0, 4)]);
+      
+      // 3秒后自动清除最旧的日志
+      setTimeout(() => {
+        setDebugLogs(prev => prev.slice(0, -1));
+      }, 3000);
+      
     } catch (err) {
       console.error("Error saving draw path:", err);
       setAlertMessage("保存绘画时出错。");
     }
-  }, [gameRoom, isDrawer, roomId]);
+  }, [isDrawer, roomId, gameRoom?.recentStrokes]); // 只依赖必要的值
 
   const handleClearDrawing = useCallback(async () => {
     if (!gameRoom || !isDrawer) return;
@@ -1086,8 +1516,15 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
     const roomDocRef = doc(db, roomDocPath);
     try {
       await updateDoc(roomDocRef, {
-        drawingPaths: []
+        recentStrokes: {
+          strokes: [],
+          startSequence: 0,
+          totalSequence: 0
+        }
       });
+      // 清空本地历史
+      drawingHistoryRef.current.clear();
+      setLocalDrawingPaths([]);
     } catch (err) {
       console.error("Error clearing drawing:", err);
       setAlertMessage("清空画板时出错。");
@@ -1110,11 +1547,16 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
       isCorrectGuess: false,
     };
 
-    let updates: Partial<GameRoom> = { chatMessages: arrayUnion(newMessage) as any };
+    // 使用新的方式管理聊天消息，限制数量
+    const updatedMessages = addChatMessage(gameRoom.chatMessages || [], newMessage);
+    let updates: Partial<GameRoom> = { chatMessages: updatedMessages };
     let newScore = currentPlayer.score;
 
     if (gameRoom.currentWord && text.toLowerCase() === gameRoom.currentWord.toLowerCase() && userId !== gameRoom.currentDrawerId && !gameRoom.guessedPlayerIds.includes(userId)) {
       newMessage.isCorrectGuess = true;
+      // 需要更新 updatedMessages 中的消息
+      updatedMessages[updatedMessages.length - 1] = newMessage;
+      updates.chatMessages = updatedMessages;
       
       const baseScore = 100;
       const orderBonus = Math.max(0, 50 - gameRoom.guessedPlayerIds.length * 20); 
@@ -1123,7 +1565,7 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
       updates.players = gameRoom.players.map(p => 
         p.id === userId ? { ...p, score: newScore } : p
       );
-      updates.guessedPlayerIds = arrayUnion(userId) as any;
+      updates.guessedPlayerIds = [...(gameRoom.guessedPlayerIds || []), userId];
 
       if (gameRoom.currentDrawerId) {
         const drawerPoints = 10; 
@@ -1136,8 +1578,7 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
       setShowSuccessModal({ playerName: currentPlayer.name, word: gameRoom.currentWord });
 
       const guessers = gameRoom.players.filter(p => p.id !== gameRoom.currentDrawerId);
-      // Ensure guessedPlayerIds is treated as an array for length check
-      const currentGuessedCount = Array.isArray(updates.guessedPlayerIds) ? (updates.guessedPlayerIds as string[]).length : (gameRoom.guessedPlayerIds.includes(userId) ? gameRoom.guessedPlayerIds.length : gameRoom.guessedPlayerIds.length + 1) ;
+      const currentGuessedCount = updates.guessedPlayerIds.length;
 
       if (currentGuessedCount >= guessers.length) {
         updates.status = 'round_end';
@@ -1170,14 +1611,18 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
         wordHint: '',
         wordLength: 0,
         timeLeft: 60,  // 改为60秒
-        drawingPaths: [],
-        chatMessages: arrayUnion({
+        recentStrokes: {
+          strokes: [],
+          startSequence: 0,
+          totalSequence: 0
+        },
+        chatMessages: addChatMessage(gameRoom.chatMessages || [], {
             id: crypto.randomUUID(),
             senderId: 'system',
             senderName: '系统',
             text: `游戏开始！${firstDrawer.name} 是第一个画手。`,
             timestamp: Date.now(),
-        }) as any,
+        }),
         guessedPlayerIds: [],
         usedWords: gameRoom.usedWords || [],
       });
@@ -1202,14 +1647,14 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
         wordHint: getWordHint(word),
         wordLength: wordLength,
         timeLeft: 60,  // 统一改为60秒，不再根据难度区分
-        chatMessages: arrayUnion({
+        chatMessages: addChatMessage(gameRoom.chatMessages || [], {
             id: crypto.randomUUID(),
             senderId: 'system',
             senderName: '系统',
             text: `${gameRoom.players.find(p=>p.id === gameRoom.currentDrawerId)?.name} 已选择词汇，开始绘画！`,
             timestamp: Date.now(),
-        }) as any,
-        usedWords: arrayUnion(word) as any,
+        }),
+        usedWords: [...(gameRoom.usedWords || []), word].slice(-MAX_USED_WORDS), // 限制已用词汇数量
       });
     } catch (err) {
       console.error("Error selecting word:", err);
@@ -1244,14 +1689,18 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
         wordHint: '',
         wordLength: 0,
         timeLeft: 60,  // 统一改为60秒，不再根据难度区分
-        drawingPaths: [],
-        chatMessages: arrayUnion({
+        recentStrokes: {
+          strokes: [],
+          startSequence: 0,
+          totalSequence: 0
+        },
+        chatMessages: addChatMessage(gameRoom.chatMessages || [], {
             id: crypto.randomUUID(),
             senderId: 'system',
             senderName: '系统',
             text: `第 ${gameRoom.currentRound + 1} 回合开始！现在由 ${nextDrawer.name} 来画。`,
             timestamp: Date.now(),
-        }) as any,
+        }),
         guessedPlayerIds: [],
       });
     } catch (err) {
@@ -1274,16 +1723,20 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
             currentDrawerId: null,
             timeLeft: 0,
             currentRound: 0,
-            drawingPaths: [],
-            chatMessages: arrayUnion({
+            recentStrokes: {
+              strokes: [],
+              startSequence: 0,
+              totalSequence: 0
+            },
+            chatMessages: [{
                 id: crypto.randomUUID(),
                 senderId: 'system',
                 senderName: '系统',
                 text: `新的一局游戏已由房主 ${gameRoom.players.find(p=>p.id === gameRoom.hostId)?.name} 创建！等待开始...`,
                 timestamp: Date.now(),
-            }) as any,
+            }], // 新游戏时清空聊天记录
             guessedPlayerIds: [],
-            usedWords: [],
+            usedWords: [], // 新游戏时清空已用词汇
             players: newPlayersState,
         });
     } catch (err) {
@@ -1306,8 +1759,23 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
   if (error || !gameRoom) return <div className="p-4 text-red-500 text-center">{error || "无法加载房间信息。"} <button onClick={onExitRoom} className="text-blue-500 underline">返回大厅</button></div>;
 
   return (
-    <div className="flex flex-col h-screen p-2 sm:p-4 bg-gray-100" style={{ backgroundColor: COLORS.backgroundLight }}>
+    <div className="flex flex-col h-full bg-gray-100" style={{ backgroundColor: COLORS.backgroundLight }}>
       <AlertModal message={alertMessage} onClose={() => setAlertMessage('')} />
+      
+      {/* 临时调试日志显示 */}
+      {debugLogs.length > 0 && (
+        <div className="fixed top-20 right-4 z-50 max-w-md">
+          <div className="bg-black bg-opacity-80 text-white p-4 rounded-lg shadow-lg">
+            <div className="text-sm font-mono space-y-1">
+              {debugLogs.map((log, index) => (
+                <div key={index} className="text-xs opacity-90">
+                  {log}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
       
       {/* 游戏胜利礼花效果 */}
       <Confetti show={gameRoom.status === 'game_end' && showSummaryModal} />
@@ -1356,18 +1824,22 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
         />
       )}
 
-      <header className="mb-2 sm:mb-4 flex justify-between items-center">
-        <h1 className="text-2xl sm:text-3xl font-bold" style={{ color: COLORS.primary }}>画笔传说 - {gameRoom.name}</h1>
+      {/* 手机端紧凑头部 */}
+      <header className="shrink-0 flex justify-between items-center p-1 lg:p-4 lg:mb-4">
+        <h1 className="text-base sm:text-2xl lg:text-3xl font-bold" style={{ color: COLORS.primary }}>
+          <span className="hidden sm:inline">画笔传说 - </span>
+          {gameRoom.name}
+        </h1>
         <button
           onClick={onExitRoom}
-          className="px-4 py-2 bg-red-500 text-white rounded-md hover:bg-red-600 transition-colors"
+          className="px-2 py-0.5 sm:px-4 sm:py-2 text-xs sm:text-base bg-red-500 text-white rounded-md hover:bg-red-600 transition-colors"
         >
-          退出房间
+          退出
         </button>
       </header>
 
       {gameRoom.status === 'waiting' && (
-        <div className="flex-grow flex flex-col items-center justify-center bg-white rounded-lg shadow-xl p-6">
+        <div className="flex-grow flex flex-col items-center justify-center bg-white rounded-lg shadow-xl p-6 m-2">
           <h2 className="text-2xl font-semibold mb-4">等待玩家加入... ({gameRoom.players.length}/{gameRoom.maxPlayers})</h2>
           <p className="text-gray-600 mb-2">房间ID: {roomId} <button onClick={() => {
               navigator.clipboard.writeText(roomId)
@@ -1401,12 +1873,12 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
             wordLength={gameRoom.wordLength || 0}
           />
 
-          {/* 手机端竖屏布局 */}
-          <main className="flex-grow flex flex-col lg:hidden gap-1 overflow-hidden">
-            {/* 画布区域 - 手机端占据主要空间 */}
-            <div className="flex-grow min-h-0 bg-gray-100 rounded-lg overflow-hidden">
+          {/* 手机端竖屏布局 - 使用CSS Grid精确控制高度 */}
+          <main className="flex-grow lg:hidden flex flex-col gap-0.5 overflow-hidden">
+            {/* 画布区域 - 占据剩余空间 */}
+            <div className="flex-1 min-h-0 bg-white overflow-hidden">
               <DrawingBoard
-                paths={gameRoom.drawingPaths}
+                paths={localDrawingPaths}
                 onDraw={handleDraw}
                 currentColor={currentColor}
                 currentWidth={currentWidth}
@@ -1415,8 +1887,10 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
                 currentTool={currentTool}
               />
             </div>
+            
+            {/* 工具栏 - 只在画手回合显示，自动高度 */}
             {isDrawer && gameRoom.status === 'playing' && !showWordChoice && (
-              <div className="shrink-0">
+              <div className="flex-shrink-0 px-0.5">
                 <ToolBar
                   color={currentColor}
                   setColor={setCurrentColor}
@@ -1430,8 +1904,8 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
               </div>
             )}
             
-            {/* 聊天区域 - 手机端高度更小 */}
-            <div className="h-[140px] sm:h-[160px] shrink-0">
+            {/* 聊天区域 - 固定高度 */}
+            <div className="flex-shrink-0 h-[130px] sm:h-[160px] px-0.5">
               <ChatBox
                 messages={gameRoom.chatMessages}
                 onSendMessage={handleSendMessage}
@@ -1440,18 +1914,18 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
               />
             </div>
             
-            {/* 玩家列表 - 手机端水平滚动，高度更小 */}
-            <div className="h-[60px] shrink-0 overflow-x-auto">
-              <div className="bg-white p-1 rounded-lg shadow-md h-full">
-                <div className="flex gap-2 h-full items-center px-1">
+            {/* 玩家列表 - 固定高度 */}
+            <div className="flex-shrink-0 h-[36px] overflow-x-auto px-0.5">
+              <div className="bg-white p-0.5 rounded-lg shadow-md h-full">
+                <div className="flex gap-1 h-full items-center px-1">
                   {gameRoom.players.map(player => (
-                    <div key={player.id} className={`flex flex-col items-center justify-center px-2 py-1 rounded-md whitespace-nowrap ${player.id === userId ? 'bg-indigo-100' : 'bg-gray-100'}`}>
+                    <div key={player.id} className={`flex flex-col items-center justify-center px-1 py-0 rounded-md whitespace-nowrap ${player.id === userId ? 'bg-indigo-100' : 'bg-gray-100'}`}>
                       <div className="flex items-center">
-                        {player.id === gameRoom.currentDrawerId && <LucidePaintbrush size={12} className="mr-1 text-accentOrange" />}
-                        {player.isHost && <LucideCrown size={12} className="mr-1 text-yellow-500" />}
-                        <span className="text-xs font-medium">{player.name}</span>
+                        {player.id === gameRoom.currentDrawerId && <LucidePaintbrush size={8} className="mr-0.5 text-accentOrange" />}
+                        {player.isHost && <LucideCrown size={8} className="mr-0.5 text-yellow-500" />}
+                        <span className="font-medium text-[10px]">{player.name}</span>
                       </div>
-                      <span className="text-xs text-primary font-semibold">{player.score}分</span>
+                      <span className="text-primary font-semibold text-[10px]">{player.score}分</span>
                     </div>
                   ))}
                 </div>
@@ -1460,7 +1934,7 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
           </main>
 
           {/* 桌面端布局 - 保持原样 */}
-          <main className="hidden lg:grid flex-grow grid-cols-4 gap-2 sm:gap-4 mt-2 sm:mt-4 overflow-hidden">
+          <main className="hidden lg:grid flex-grow grid-cols-4 gap-2 sm:gap-4 mt-2 sm:mt-4 overflow-hidden p-4">
             <div className="col-span-1 h-full min-h-[200px]">
               <PlayerList players={gameRoom.players} currentPlayerId={userId} currentDrawerId={gameRoom.currentDrawerId} />
             </div>
@@ -1468,7 +1942,7 @@ const GameRoomScreen: React.FC<{ roomId: string; userId: string; user: User | nu
             <div className="col-span-2 h-full flex flex-col">
               <div className="flex-grow relative">
                 <DrawingBoard
-                  paths={gameRoom.drawingPaths}
+                  paths={localDrawingPaths}
                   onDraw={handleDraw}
                   currentColor={currentColor}
                   currentWidth={currentWidth}
@@ -1787,6 +2261,26 @@ const App: React.FC = () => {
   const [currentPlayerName, setCurrentPlayerName] = useState('');
   const [alertMessage, setAlertMessage] = useState('');
 
+  // 动态设置视口高度（解决移动端浏览器工具栏问题）
+  useEffect(() => {
+    const setVH = () => {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty('--vh', `${vh}px`);
+    };
+
+    // 初始设置
+    setVH();
+
+    // 监听窗口大小变化
+    window.addEventListener('resize', setVH);
+    window.addEventListener('orientationchange', setVH);
+
+    return () => {
+      window.removeEventListener('resize', setVH);
+      window.removeEventListener('orientationchange', setVH);
+    };
+  }, []);
+
   // Firebase Auth
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
@@ -1869,11 +2363,15 @@ const App: React.FC = () => {
       const roomsCollectionPath = getRoomsCollectionPath();
       const roomDocRef = await addDoc(collection(db, roomsCollectionPath), {
         ...newRoomData,
-        drawingPaths: [], 
         chatMessages: [],
         guessedPlayerIds: [],
         usedWords: [],
         wordLength: 0,
+        recentStrokes: {
+          strokes: [],
+          startSequence: 0,
+          totalSequence: 0
+        }
       });
       setCurrentPlayerName(playerName);
       return roomDocRef.id;
@@ -1915,13 +2413,13 @@ const App: React.FC = () => {
                             ...p,
                             isHost: index === 0 
                         }));
-                        updates.chatMessages = arrayUnion({
+                        updates.chatMessages = addChatMessage(roomData.chatMessages || [], {
                             id: crypto.randomUUID(),
                             senderId: 'system',
                             senderName: '系统',
                             text: `${roomData.players.find(p=>p.id === userId)?.name} (房主) 已离开房间。新房主是 ${remainingPlayers[0].name}。`,
                             timestamp: Date.now(),
-                        }) as any;
+                        });
                     }
                     await updateDoc(roomDocRef, updates);
                 }
@@ -1940,7 +2438,7 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="font-sans antialiased">
+    <div className="font-sans antialiased h-full flex flex-col">
       <AlertModal message={alertMessage} onClose={() => setAlertMessage('')} />
       {currentScreen === 'lobby' && userId && (
         <LobbyScreen
